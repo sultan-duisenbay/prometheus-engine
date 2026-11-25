@@ -196,7 +196,7 @@ func (r *collectionReconciler) ensureCollectorSecrets(ctx context.Context, spec 
 	}
 	if spec.Credentials != nil {
 		p := pathForSelector(r.opts.PublicNamespace, &monitoringv1.SecretOrConfigMap{Secret: spec.Credentials})
-		b, err := getSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, spec.Credentials)
+		b, err := getPublicSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, r.opts.OperatorNamespace, spec.Credentials)
 		if err != nil {
 			return err
 		}

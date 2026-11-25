@@ -230,6 +230,14 @@ func (r *operatorConfigReconciler) Reconcile(ctx context.Context, req reconcile.
 		return reconcile.Result{}, fmt.Errorf("ensure rule-evaluator config: %w", err)
 	}
 
+	// Mirror the fetched secret data to where the rule-evaluator can
+	// mount and access before reconciling Alertmanager, so an Alertmanager
+	// config error cannot starve Secret/rules after ConfigMap/rule-evaluator
+	// has already been updated.
+	if err := r.ensureRuleEvaluatorSecrets(ctx, secretData); err != nil {
+		return reconcile.Result{}, fmt.Errorf("ensure rule-evaluator secrets: %w", err)
+	}
+
 	// Ensure the alertmanager configuration is pulled from the spec.
 	if err := r.ensureAlertmanagerConfigSecret(ctx, config.ManagedAlertmanager); err != nil {
 		return reconcile.Result{}, fmt.Errorf("ensure alertmanager config secret: %w", err)
@@ -237,12 +245,6 @@ func (r *operatorConfigReconciler) Reconcile(ctx context.Context, req reconcile.
 
 	if err := r.ensureAlertmanagerStatefulSet(ctx, config.ManagedAlertmanager); err != nil {
 		return reconcile.Result{}, fmt.Errorf("ensure alertmanager statefulset: %w", err)
-	}
-
-	// Mirror the fetched secret data to where the rule-evaluator can
-	// mount and access.
-	if err := r.ensureRuleEvaluatorSecrets(ctx, secretData); err != nil {
-		return reconcile.Result{}, fmt.Errorf("ensure rule-evaluator secrets: %w", err)
 	}
 
 	// Ensure the rule-evaluator deployment and volume mounts.
@@ -329,7 +331,7 @@ func (r *operatorConfigReconciler) makeRuleEvaluatorConfig(ctx context.Context, 
 	}
 	if spec.Credentials != nil {
 		p := pathForSelector(r.opts.PublicNamespace, &monitoringv1.SecretOrConfigMap{Secret: spec.Credentials})
-		b, err := getSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, spec.Credentials)
+		b, err := getPublicSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, r.opts.OperatorNamespace, spec.Credentials)
 		if err != nil {
 			return nil, nil, fmt.Errorf("get service account credentials: %w", err)
 		}
@@ -431,16 +433,38 @@ func (r *operatorConfigReconciler) ensureAlertmanagerConfigSecret(ctx context.Co
 		sel.Key = spec.ConfigSecret.Key
 	}
 
-	// Try and read the secret for use.
-	b, err := getSecretKeyBytes(ctx, r.client, pubNamespace, sel)
+	sameNSDefaultSecret := pubNamespace == r.opts.OperatorNamespace && sel.Name == AlertmanagerSecretName
+	var (
+		b   []byte
+		err error
+	)
+	if sameNSDefaultSecret {
+		if sel.Key != AlertmanagerPublicSecretKey {
+			return fmt.Errorf("alertmanager config secret %q in namespace %q collides with operator output secret %q; use a distinct secret name when public and operator namespaces match", sel.Name, pubNamespace, AlertmanagerSecretName)
+		}
+		// Probe raw secret: CRD defaulting populates alertmanager/alertmanager.yaml even
+		// when unused, so missing key is safe while a present key must fail without overwriting.
+		b, err = getSecretKeyBytes(ctx, r.client, pubNamespace, sel)
+	} else {
+		b, err = getPublicSecretKeyBytes(ctx, r.client, pubNamespace, r.opts.OperatorNamespace, sel)
+	}
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
+		sameNSDefaultMissingKey := sameNSDefaultSecret && errors.Is(err, errSecretKeyNotFound)
+		if !apierrors.IsNotFound(err) && !sameNSDefaultMissingKey {
 			return err
 		}
-		// If the config secret is not found, it may have been manually deleted
-		// (ie, to disable managed AM), so we will continue with restoring the no-op config
-		// so that the managed AM pod doesn't crash loop.
-		logger.Info(fmt.Sprintf("alertmanager config secret not found in namespace %s: %s", pubNamespace, err.Error()))
+		// Missing config secret (or missing default key in a shared namespace) restores
+		// the no-op config so the Alertmanager pod does not crash loop.
+		if sameNSDefaultMissingKey {
+			logger.Info("skipping default alertmanager config secret because public and operator namespaces match", "namespace", pubNamespace)
+		} else {
+			logger.Info(fmt.Sprintf("alertmanager config secret not found in namespace %s: %s", pubNamespace, err.Error()))
+		}
+		if spec != nil && spec.ExternalURL != "" {
+			logger.Info("warning: ignoring managedAlertmanager.externalURL because no user alertmanager config secret is present", "namespace", pubNamespace, "externalURL", spec.ExternalURL)
+		}
+	} else if sameNSDefaultSecret {
+		return fmt.Errorf("alertmanager config secret %q in namespace %q contains key %q and collides with operator output secret %q; use a distinct secret name when public and operator namespaces match", sel.Name, pubNamespace, sel.Key, AlertmanagerSecretName)
 	} else {
 		config := alertmanagerConfig{}
 		if err := yaml.Unmarshal(b, &config); err != nil {
@@ -450,7 +474,7 @@ func (r *operatorConfigReconciler) ensureAlertmanagerConfigSecret(ctx context.Co
 		// Only set the value if we need to. This provides a fail-safe in case users change our
 		// Alertmanager image with their own. Otherwise, if we always set and they change the image,
 		// their Alertmanager will fail unless they have our patch.
-		if config.GoogleCloud.ExternalURL != spec.ExternalURL {
+		if spec != nil && config.GoogleCloud.ExternalURL != spec.ExternalURL {
 			config.GoogleCloud.ExternalURL = spec.ExternalURL
 
 			// NOTE: We can't use direct marshal on alertmanagerConfig because of
@@ -614,7 +638,7 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 				Type: am.Authorization.Type,
 			}
 			if c := am.Authorization.Credentials; c != nil {
-				b, err := getSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, c)
+				b, err := getPublicSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, r.opts.OperatorNamespace, c)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -644,7 +668,7 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 
 			if am.TLS.CA != nil {
 				p := pathForSelector(r.opts.PublicNamespace, am.TLS.CA)
-				b, err := getSecretOrConfigMapBytes(ctx, r.client, r.opts.PublicNamespace, am.TLS.CA)
+				b, err := getSecretOrConfigMapBytes(ctx, r.client, r.opts.PublicNamespace, r.opts.OperatorNamespace, am.TLS.CA)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -653,7 +677,7 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 			}
 			if am.TLS.Cert != nil {
 				p := pathForSelector(r.opts.PublicNamespace, am.TLS.Cert)
-				b, err := getSecretOrConfigMapBytes(ctx, r.client, r.opts.PublicNamespace, am.TLS.Cert)
+				b, err := getSecretOrConfigMapBytes(ctx, r.client, r.opts.PublicNamespace, r.opts.OperatorNamespace, am.TLS.Cert)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -662,7 +686,7 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 			}
 			if am.TLS.KeySecret != nil {
 				p := pathForSelector(r.opts.PublicNamespace, &monitoringv1.SecretOrConfigMap{Secret: am.TLS.KeySecret})
-				b, err := getSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, am.TLS.KeySecret)
+				b, err := getPublicSecretKeyBytes(ctx, r.client, r.opts.PublicNamespace, r.opts.OperatorNamespace, am.TLS.KeySecret)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -733,25 +757,42 @@ func (r *operatorConfigReconciler) makeAlertmanagerConfigs(ctx context.Context, 
 	return configs, secretData, nil
 }
 
-// getSecretOrConfigMapBytes is a helper function to conditionally fetch
-// the secret or configmap selector payloads.
-func getSecretOrConfigMapBytes(ctx context.Context, c client.Reader, namespace string, scm *monitoringv1.SecretOrConfigMap) ([]byte, error) {
-	var (
-		b   []byte
-		err error
-	)
+// getSecretOrConfigMapBytes fetches a public-namespace Secret or ConfigMap key,
+// rejecting references to operator output objects when namespaces match.
+func getSecretOrConfigMapBytes(ctx context.Context, c client.Reader, pubNamespace, opNamespace string, scm *monitoringv1.SecretOrConfigMap) ([]byte, error) {
 	if secret := scm.Secret; secret != nil {
-		b, err = getSecretKeyBytes(ctx, c, namespace, secret)
-		if err != nil {
-			return b, err
-		}
-	} else if cm := scm.ConfigMap; cm != nil {
-		b, err = getConfigMapKeyBytes(ctx, c, namespace, cm)
-		if err != nil {
-			return b, err
+		return getPublicSecretKeyBytes(ctx, c, pubNamespace, opNamespace, secret)
+	}
+	if cm := scm.ConfigMap; cm != nil {
+		return getPublicConfigMapKeyBytes(ctx, c, pubNamespace, opNamespace, cm)
+	}
+	return nil, nil
+}
+
+var errSecretKeyNotFound = errors.New("not found")
+
+// getPublicSecretKeyBytes reads a user Secret in pubNamespace, rejecting
+// operator-owned output secrets when pubNamespace == opNamespace.
+func getPublicSecretKeyBytes(ctx context.Context, c client.Reader, pubNamespace, opNamespace string, sel *corev1.SecretKeySelector) ([]byte, error) {
+	if pubNamespace == opNamespace {
+		switch sel.Name {
+		case CollectionSecretName, RulesSecretName, AlertmanagerSecretName:
+			return nil, fmt.Errorf("secret %q in namespace %q collides with operator output secret %q; use a distinct secret name when public and operator namespaces match", sel.Name, pubNamespace, sel.Name)
 		}
 	}
-	return b, nil
+	return getSecretKeyBytes(ctx, c, pubNamespace, sel)
+}
+
+// getPublicConfigMapKeyBytes reads a user ConfigMap in pubNamespace, rejecting
+// operator-owned output ConfigMaps when pubNamespace == opNamespace.
+func getPublicConfigMapKeyBytes(ctx context.Context, c client.Reader, pubNamespace, opNamespace string, sel *corev1.ConfigMapKeySelector) ([]byte, error) {
+	if pubNamespace == opNamespace {
+		switch sel.Name {
+		case NameCollector, NameRuleEvaluator, nameRulesGenerated:
+			return nil, fmt.Errorf("configmap %q in namespace %q collides with operator output configmap %q; use a distinct configmap name when public and operator namespaces match", sel.Name, pubNamespace, sel.Name)
+		}
+	}
+	return getConfigMapKeyBytes(ctx, c, pubNamespace, sel)
 }
 
 // getSecretKeyBytes processes the given NamespacedSecretKeySelector and returns the referenced data.
@@ -772,7 +813,7 @@ func getSecretKeyBytes(ctx context.Context, c client.Reader, namespace string, s
 	} else if s, ok := secret.StringData[sel.Key]; ok {
 		return []byte(s), nil
 	}
-	return nil, fmt.Errorf("key %q in secret %q not found", sel.Key, sel.Name)
+	return nil, fmt.Errorf("key %q in secret %q %w", sel.Key, sel.Name, errSecretKeyNotFound)
 }
 
 // getConfigMapKeyBytes processes the given NamespacedConfigMapKeySelector and returns the referenced data.

@@ -17,11 +17,13 @@ package operator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	monitoringv1 "github.com/GoogleCloudPlatform/prometheus-engine/pkg/operator/apis/monitoring/v1"
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	promforkconfig "github.com/prometheus/prometheus/config"
@@ -456,6 +458,433 @@ route:
 			require.Equal(t, tcase.expectedAmConfig, string(b))
 		})
 	}
+}
+
+func countWrites(calls *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			*calls++
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			*calls++
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+}
+
+func TestEnsureAlertmanagerConfigSecretSameNamespace(t *testing.T) {
+	sharedNS := "tenant-a-system"
+	sharedOpts := Options{
+		ProjectID:         "test-project",
+		Location:          "us-central1-c",
+		Cluster:           "test-cluster",
+		PublicNamespace:   sharedNS,
+		OperatorNamespace: sharedNS,
+	}
+
+	t.Run("user alertmanager.yaml in colliding default secret returns error without overwriting", func(t *testing.T) {
+		userConfig := "receivers:\n  - name: pagerduty\nroute:\n  receiver: pagerduty\n"
+		for _, tc := range []struct {
+			name string
+			spec *monitoringv1.ManagedAlertmanagerSpec
+		}{
+			{
+				name: "nil spec",
+				spec: nil,
+			},
+			{
+				name: "CRD-defaulted spec",
+				spec: &monitoringv1.ManagedAlertmanagerSpec{
+					ConfigSecret: &corev1.SecretKeySelector{
+						Name: AlertmanagerPublicSecretName,
+						Key:  AlertmanagerPublicSecretKey,
+					},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				writeCalls := 0
+				kubeClient := newFakeClientBuilder().
+					WithObjects(&corev1.Secret{
+						Namespace: sharedNS,
+						Name:      AlertmanagerSecretName,
+						Data: map[string][]byte{
+							AlertmanagerPublicSecretKey: []byte(userConfig),
+						},
+					}).
+					WithInterceptorFuncs(countWrites(&writeCalls)).
+					Build()
+				reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+
+				err := reconciler.ensureAlertmanagerConfigSecret(ctx, tc.spec)
+				require.ErrorContains(t, err, `collides with operator output secret "alertmanager"`)
+				require.Equal(t, 0, writeCalls)
+
+				var amSecret corev1.Secret
+				require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+				require.Equal(t, map[string][]byte{AlertmanagerPublicSecretKey: []byte(userConfig)}, amSecret.Data)
+			})
+		}
+	})
+
+	t.Run("no OperatorConfig with pre-created empty output secret succeeds across reconciles", func(t *testing.T) {
+		ctx := t.Context()
+		kubeClient := newFakeClientBuilder().WithObjects(
+			&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      AlertmanagerSecretName,
+			},
+		).Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+		req := reconcile.Request{
+			Namespace: sharedNS,
+			Name:      NameOperatorConfig,
+		}
+
+		// Second reconcile must not fail on the output secret lacking alertmanager.yaml.
+		for range 2 {
+			_, err := reconciler.Reconcile(ctx, req)
+			require.NoError(t, err)
+		}
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		require.Equal(t, AlertmanagerNoOpConfig, string(amSecret.Data[AlertmanagerConfigKey]))
+
+		var rulesSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: RulesSecretName}, &rulesSecret))
+	})
+
+	t.Run("OperatorConfig without configSecret succeeds with operator-only output secret", func(t *testing.T) {
+		ctx := t.Context()
+		kubeClient := newFakeClientBuilder().WithObjects(
+			&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      AlertmanagerSecretName,
+				Data:      map[string][]byte{AlertmanagerConfigKey: []byte(AlertmanagerNoOpConfig)},
+			},
+		).Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+
+		require.NoError(t, reconciler.ensureAlertmanagerConfigSecret(ctx, &monitoringv1.ManagedAlertmanagerSpec{}))
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		require.Equal(t, AlertmanagerNoOpConfig, string(amSecret.Data[AlertmanagerConfigKey]))
+	})
+
+	t.Run("CRD-defaulted OperatorConfig succeeds with operator-only output secret and warns on ignored externalURL", func(t *testing.T) {
+		var logs []string
+		logger := funcr.New(func(prefix, args string) {
+			logs = append(logs, prefix+" "+args)
+		}, funcr.Options{})
+		ctx := logr.NewContext(t.Context(), logger)
+		kubeClient := newFakeClientBuilder().WithObjects(
+			&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      AlertmanagerSecretName,
+				Data:      map[string][]byte{AlertmanagerConfigKey: []byte(AlertmanagerNoOpConfig)},
+			},
+		).Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+
+		defaultedSpec := &monitoringv1.ManagedAlertmanagerSpec{
+			ConfigSecret: &corev1.SecretKeySelector{
+				Name: AlertmanagerPublicSecretName,
+				Key:  AlertmanagerPublicSecretKey,
+			},
+			ExternalURL: "https://alertmanager.example.com/",
+		}
+		require.NoError(t, reconciler.ensureAlertmanagerConfigSecret(ctx, defaultedSpec))
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		require.Equal(t, AlertmanagerNoOpConfig, string(amSecret.Data[AlertmanagerConfigKey]))
+		require.Contains(t, strings.Join(logs, "\n"), "ignoring managedAlertmanager.externalURL")
+	})
+
+	t.Run("transient Get error on colliding default secret returns error without overwriting", func(t *testing.T) {
+		ctx := t.Context()
+		writeCalls := 0
+		fns := countWrites(&writeCalls)
+		fns.Get = func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			return errors.New("apiserver unavailable")
+		}
+		kubeClient := newFakeClientBuilder().
+			WithInterceptorFuncs(fns).
+			Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+
+		err := reconciler.ensureAlertmanagerConfigSecret(ctx, nil)
+		require.ErrorContains(t, err, "apiserver unavailable")
+		require.Equal(t, 0, writeCalls)
+	})
+
+	t.Run("explicit non-default key on colliding output secret returns error without overwriting", func(t *testing.T) {
+		ctx := t.Context()
+		origData := map[string][]byte{"custom.yaml": []byte(AlertmanagerNoOpConfig)}
+		writeCalls := 0
+		kubeClient := newFakeClientBuilder().
+			WithObjects(&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      AlertmanagerSecretName,
+				Data:      origData,
+			}).
+			WithInterceptorFuncs(countWrites(&writeCalls)).
+			Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+
+		spec := &monitoringv1.ManagedAlertmanagerSpec{
+			ConfigSecret: &corev1.SecretKeySelector{
+				Name: AlertmanagerSecretName,
+				Key:  "custom.yaml",
+			},
+		}
+		err := reconciler.ensureAlertmanagerConfigSecret(ctx, spec)
+		require.ErrorContains(t, err, `collides with operator output secret "alertmanager"`)
+		require.Equal(t, 0, writeCalls)
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		require.Equal(t, origData, amSecret.Data)
+	})
+
+	t.Run("custom configSecret with externalURL in same namespace loads and reverting to default restores no-op", func(t *testing.T) {
+		ctx := t.Context()
+		customYAML := "receivers:\n  - name: custom\nroute:\n  receiver: custom\n"
+		kubeClient := newFakeClientBuilder().WithObjects(
+			&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      "custom-alertmanager",
+				Data:      map[string][]byte{AlertmanagerPublicSecretKey: []byte(customYAML)},
+			},
+		).Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+
+		customSpec := &monitoringv1.ManagedAlertmanagerSpec{
+			ConfigSecret: &corev1.SecretKeySelector{
+				Name: "custom-alertmanager",
+				Key:  AlertmanagerPublicSecretKey,
+			},
+			ExternalURL: "https://alertmanager.example.com/",
+		}
+		require.NoError(t, reconciler.ensureAlertmanagerConfigSecret(ctx, customSpec))
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		expectedCustomWithURL := `
+google_cloud:
+  external_url: https://alertmanager.example.com/
+receivers:
+  - name: custom
+route:
+  receiver: custom
+`
+		require.YAMLEq(t, expectedCustomWithURL, string(amSecret.Data[AlertmanagerConfigKey]))
+
+		defaultSpec := &monitoringv1.ManagedAlertmanagerSpec{
+			ConfigSecret: &corev1.SecretKeySelector{
+				Name: AlertmanagerPublicSecretName,
+				Key:  AlertmanagerPublicSecretKey,
+			},
+		}
+		require.NoError(t, reconciler.ensureAlertmanagerConfigSecret(ctx, defaultSpec))
+
+		amSecret = corev1.Secret{}
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		require.Equal(t, AlertmanagerNoOpConfig, string(amSecret.Data[AlertmanagerConfigKey]))
+	})
+
+	t.Run("Secret/rules still reconciles when ensureAlertmanagerConfigSecret returns collision error", func(t *testing.T) {
+		ctx := t.Context()
+		userAMConfig := "receivers:\n  - name: pagerduty\nroute:\n  receiver: pagerduty\n"
+		saCreds := []byte(`{"type":"service_account"}`)
+		opConfig := &monitoringv1.OperatorConfig{
+			Namespace: sharedNS,
+			Name:      NameOperatorConfig,
+			Rules: monitoringv1.RuleEvaluatorSpec{
+				Credentials: &corev1.SecretKeySelector{
+					Name: "rule-sa-creds",
+					Key:  "key.json",
+				},
+			},
+			ManagedAlertmanager: &monitoringv1.ManagedAlertmanagerSpec{
+				ConfigSecret: &corev1.SecretKeySelector{
+					Name: AlertmanagerPublicSecretName,
+					Key:  AlertmanagerPublicSecretKey,
+				},
+			},
+		}
+		kubeClient := newFakeClientBuilder().WithObjects(
+			opConfig,
+			&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      "rule-sa-creds",
+				Data:      map[string][]byte{"key.json": saCreds},
+			},
+			&corev1.Secret{
+				Namespace: sharedNS,
+				Name:      AlertmanagerSecretName,
+				Data:      map[string][]byte{AlertmanagerPublicSecretKey: []byte(userAMConfig)},
+			},
+		).Build()
+
+		reconciler := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			Namespace: sharedNS,
+			Name:      NameOperatorConfig,
+		})
+		require.ErrorContains(t, err, `collides with operator output secret "alertmanager"`)
+
+		var ruleEvalCM corev1.ConfigMap
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: NameRuleEvaluator}, &ruleEvalCM))
+		require.NotEmpty(t, ruleEvalCM.Data[configFilename])
+
+		var rulesSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: RulesSecretName}, &rulesSecret))
+		credKey := pathForSelector(sharedNS, &monitoringv1.SecretOrConfigMap{Secret: opConfig.Rules.Credentials})
+		require.Equal(t, saCreds, rulesSecret.Data[credKey])
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: AlertmanagerSecretName}, &amSecret))
+		require.Equal(t, map[string][]byte{AlertmanagerPublicSecretKey: []byte(userAMConfig)}, amSecret.Data)
+	})
+
+	t.Run("shared namespace rejects operator output secret and configmap refs without overwriting", func(t *testing.T) {
+		ctx := t.Context()
+
+		for _, collidingName := range []string{CollectionSecretName, RulesSecretName, AlertmanagerSecretName} {
+			origData := map[string][]byte{"key.json": []byte("user-secret-data")}
+			sel := &corev1.SecretKeySelector{Name: collidingName, Key: "key.json"}
+			kubeClient := newFakeClientBuilder().WithObjects(
+				&corev1.Secret{
+					Namespace: sharedNS,
+					Name:      collidingName,
+					Data:      origData,
+				},
+			).Build()
+
+			colRec := newCollectionReconciler(kubeClient, sharedOpts)
+			err := colRec.ensureCollectorSecrets(ctx, &monitoringv1.CollectionSpec{Credentials: sel})
+			require.ErrorContains(t, err, "collides with operator output secret")
+
+			opRec := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+			ruleSpecs := []*monitoringv1.RuleEvaluatorSpec{
+				{Credentials: sel},
+				{Alerting: monitoringv1.AlertingSpec{Alertmanagers: []monitoringv1.AlertmanagerEndpoints{{
+					Namespace: sharedNS, Name: "am-svc", Authorization: &monitoringv1.Authorization{Credentials: sel},
+				}}}},
+				{Alerting: monitoringv1.AlertingSpec{Alertmanagers: []monitoringv1.AlertmanagerEndpoints{{
+					Namespace: sharedNS, Name: "am-svc", TLS: &monitoringv1.TLSConfig{CA: &monitoringv1.SecretOrConfigMap{Secret: sel}},
+				}}}},
+				{Alerting: monitoringv1.AlertingSpec{Alertmanagers: []monitoringv1.AlertmanagerEndpoints{{
+					Namespace: sharedNS, Name: "am-svc", TLS: &monitoringv1.TLSConfig{Cert: &monitoringv1.SecretOrConfigMap{Secret: sel}},
+				}}}},
+				{Alerting: monitoringv1.AlertingSpec{Alertmanagers: []monitoringv1.AlertmanagerEndpoints{{
+					Namespace: sharedNS, Name: "am-svc", TLS: &monitoringv1.TLSConfig{KeySecret: sel},
+				}}}},
+			}
+			for _, spec := range ruleSpecs {
+				_, err = opRec.ensureRuleEvaluatorConfig(ctx, spec)
+				require.ErrorContains(t, err, "collides with operator output secret")
+			}
+
+			var got corev1.Secret
+			require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: collidingName}, &got))
+			require.Equal(t, origData, got.Data)
+		}
+
+		for _, collidingName := range []string{CollectionSecretName, RulesSecretName} {
+			kubeClient := newFakeClientBuilder().Build()
+			opRec := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+			err := opRec.ensureAlertmanagerConfigSecret(ctx, &monitoringv1.ManagedAlertmanagerSpec{
+				ConfigSecret: &corev1.SecretKeySelector{
+					Name: collidingName,
+					Key:  AlertmanagerPublicSecretKey,
+				},
+			})
+			require.ErrorContains(t, err, "collides with operator output secret")
+		}
+
+		for _, collidingCM := range []string{NameCollector, NameRuleEvaluator, nameRulesGenerated} {
+			origData := map[string]string{"ca.crt": "user-ca-cert"}
+			cmSel := &corev1.ConfigMapKeySelector{Name: collidingCM, Key: "ca.crt"}
+			kubeClient := newFakeClientBuilder().WithObjects(
+				&corev1.ConfigMap{
+					Namespace: sharedNS,
+					Name:      collidingCM,
+					Data:      origData,
+				},
+			).Build()
+			opRec := newOperatorConfigReconciler(kubeClient, sharedOpts, false)
+			for _, tlsCfg := range []*monitoringv1.TLSConfig{
+				{CA: &monitoringv1.SecretOrConfigMap{ConfigMap: cmSel}},
+				{Cert: &monitoringv1.SecretOrConfigMap{ConfigMap: cmSel}},
+			} {
+				_, err := opRec.ensureRuleEvaluatorConfig(ctx, &monitoringv1.RuleEvaluatorSpec{
+					Alerting: monitoringv1.AlertingSpec{Alertmanagers: []monitoringv1.AlertmanagerEndpoints{{
+						Namespace: sharedNS, Name: "am-svc", TLS: tlsCfg,
+					}}},
+				})
+				require.ErrorContains(t, err, "collides with operator output configmap")
+			}
+
+			var got corev1.ConfigMap
+			require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: sharedNS, Name: collidingCM}, &got))
+			require.Equal(t, origData, got.Data)
+		}
+	})
+
+	t.Run("distinct namespaces with nil spec and existing public secret succeed", func(t *testing.T) {
+		ctx := t.Context()
+		distinctOpts := Options{
+			ProjectID:         "test-project",
+			Location:          "us-central1-c",
+			Cluster:           "test-cluster",
+			PublicNamespace:   DefaultPublicNamespace,
+			OperatorNamespace: DefaultOperatorNamespace,
+		}
+		publicYAML := "google_cloud:\n  external_url: https://alertmanager.example.com/\nreceivers:\n  - name: custom\nroute:\n  receiver: custom\n"
+		kubeClient := newFakeClientBuilder().WithObjects(
+			&corev1.Secret{
+				Namespace: DefaultPublicNamespace,
+				Name:      AlertmanagerPublicSecretName,
+				Data:      map[string][]byte{AlertmanagerPublicSecretKey: []byte(publicYAML)},
+			},
+		).Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, distinctOpts, false)
+
+		require.NoError(t, reconciler.ensureAlertmanagerConfigSecret(ctx, nil))
+
+		var amSecret corev1.Secret
+		require.NoError(t, kubeClient.Get(ctx, client.ObjectKey{Namespace: DefaultOperatorNamespace, Name: AlertmanagerSecretName}, &amSecret))
+		require.YAMLEq(t, publicYAML, string(amSecret.Data[AlertmanagerConfigKey]))
+	})
+
+	t.Run("distinct namespaces still error when default public secret lacks expected key", func(t *testing.T) {
+		ctx := t.Context()
+		distinctOpts := Options{
+			ProjectID:         "test-project",
+			Location:          "us-central1-c",
+			Cluster:           "test-cluster",
+			PublicNamespace:   DefaultPublicNamespace,
+			OperatorNamespace: DefaultOperatorNamespace,
+		}
+		kubeClient := newFakeClientBuilder().WithObjects(
+			&corev1.Secret{
+				Namespace: DefaultPublicNamespace,
+				Name:      AlertmanagerPublicSecretName,
+				Data:      map[string][]byte{"other.yaml": []byte("unused")},
+			},
+		).Build()
+		reconciler := newOperatorConfigReconciler(kubeClient, distinctOpts, false)
+
+		err := reconciler.ensureAlertmanagerConfigSecret(ctx, nil)
+		require.ErrorIs(t, err, errSecretKeyNotFound)
+		require.ErrorContains(t, err, `key "alertmanager.yaml" in secret "alertmanager" not found`)
+	})
 }
 
 func TestOperatorConfigReconcileVPAUnavailable(t *testing.T) {
