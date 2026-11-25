@@ -203,12 +203,8 @@ func (r *collectionReconciler) ensureCollectorSecrets(ctx context.Context, spec 
 		secret.Data[p] = b
 	}
 
-	if err := r.client.Update(ctx, secret); apierrors.IsNotFound(err) {
-		if err := r.client.Create(ctx, secret); err != nil {
-			return fmt.Errorf("create collector secrets: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("update collector secrets: %w", err)
+	if err := upsertSecret(ctx, r.client, secret); err != nil {
+		return fmt.Errorf("upsert collector secrets: %w", err)
 	}
 	return nil
 }
@@ -299,12 +295,8 @@ func (r *collectionReconciler) ensureCollectorConfig(ctx context.Context, spec *
 		return err
 	}
 
-	if err := r.client.Update(ctx, cm); apierrors.IsNotFound(err) {
-		if err := r.client.Create(ctx, cm); err != nil {
-			return fmt.Errorf("create Prometheus config: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("update Prometheus config: %w", err)
+	if err := upsertConfigMap(ctx, r.client, cm); err != nil {
+		return fmt.Errorf("upsert Prometheus config: %w", err)
 	}
 
 	// Reconcile any status updates.

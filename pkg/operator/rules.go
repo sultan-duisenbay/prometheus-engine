@@ -342,12 +342,8 @@ func (r *rulesReconciler) ensureRuleConfigs(ctx context.Context, projectID, loca
 	}
 
 	// Create or update generated rule ConfigMap.
-	if err := r.client.Update(ctx, cm); apierrors.IsNotFound(err) {
-		if err := r.client.Create(ctx, cm); err != nil {
-			return fmt.Errorf("create generated rules: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("update generated rules: %w", err)
+	if err := upsertConfigMap(ctx, r.client, cm); err != nil {
+		return fmt.Errorf("upsert generated rules: %w", err)
 	}
 
 	var errs []error

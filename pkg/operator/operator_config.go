@@ -309,12 +309,8 @@ func (r *operatorConfigReconciler) ensureRuleEvaluatorConfig(ctx context.Context
 	}
 
 	// Upsert rule-evaluator config.
-	if err := r.client.Update(ctx, cfg); apierrors.IsNotFound(err) {
-		if err := r.client.Create(ctx, cfg); err != nil {
-			return nil, fmt.Errorf("create rule-evaluator config: %w", err)
-		}
-	} else if err != nil {
-		return nil, fmt.Errorf("update rule-evaluator config: %w", err)
+	if err := upsertConfigMap(ctx, r.client, cfg); err != nil {
+		return nil, fmt.Errorf("upsert rule-evaluator config: %w", err)
 	}
 	return secretData, nil
 }
@@ -392,12 +388,8 @@ func (r *operatorConfigReconciler) ensureRuleEvaluatorSecrets(ctx context.Contex
 	}
 	maps.Copy(secret.Data, data)
 
-	if err := r.client.Update(ctx, secret); apierrors.IsNotFound(err) {
-		if err := r.client.Create(ctx, secret); err != nil {
-			return fmt.Errorf("create rule-evaluator secrets: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("update rule-evaluator secrets: %w", err)
+	if err := upsertSecret(ctx, r.client, secret); err != nil {
+		return fmt.Errorf("upsert rule-evaluator secrets: %w", err)
 	}
 	return nil
 }
@@ -463,12 +455,8 @@ func (r *operatorConfigReconciler) ensureAlertmanagerConfigSecret(ctx context.Co
 		secret.Data[AlertmanagerConfigKey] = b
 	}
 
-	if err := r.client.Update(ctx, secret); apierrors.IsNotFound(err) {
-		if err := r.client.Create(ctx, secret); err != nil {
-			return fmt.Errorf("create alertmanager config secret: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("update alertmanager config secret: %w", err)
+	if err := upsertSecret(ctx, r.client, secret); err != nil {
+		return fmt.Errorf("upsert alertmanager config secret: %w", err)
 	}
 	return nil
 }
